@@ -189,7 +189,8 @@ function Get-DomainList {
         throw "No domains found in file: $Path"
     }
 
-    return $domainList
+    # Ensure we always return an array (PowerShell can unwrap single items)
+    return , $domainList
 }
 
 function Test-DomainThreat {
