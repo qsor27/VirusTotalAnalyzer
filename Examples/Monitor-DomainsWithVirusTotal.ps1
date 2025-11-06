@@ -142,7 +142,13 @@ function Get-Configuration {
 function Get-DomainList {
     <#
     .SYNOPSIS
-        Reads domains from a text file.
+        Reads domains from a text file with optional per-domain email recipients.
+    .DESCRIPTION
+        Parses domains file supporting two formats:
+        1. Simple: domain.com
+        2. With additional recipients: domain.com,email1@example.com,email2@example.com
+
+        Additional recipients are added to the default recipients for that domain's alerts.
     #>
     [CmdletBinding()]
     param(
@@ -154,15 +160,36 @@ function Get-DomainList {
         throw "Domains file not found: $Path"
     }
 
-    $domains = Get-Content -Path $Path | Where-Object {
-        $_ -match '\S' -and $_ -notmatch '^\s*#'
-    } | ForEach-Object { $_.Trim() }
+    $domainList = @()
 
-    if ($domains.Count -eq 0) {
+    Get-Content -Path $Path | Where-Object {
+        $_ -match '\S' -and $_ -notmatch '^\s*#'
+    } | ForEach-Object {
+        $line = $_.Trim()
+        $parts = $line -split ',' | ForEach-Object { $_.Trim() }
+
+        # First part is always the domain
+        $domain = $parts[0]
+
+        # Remaining parts are additional email recipients (if any)
+        $additionalEmails = @()
+        if ($parts.Count -gt 1) {
+            $additionalEmails = $parts[1..($parts.Count - 1)] | Where-Object {
+                $_ -match '^[\w\.-]+@[\w\.-]+\.\w+$'
+            }
+        }
+
+        $domainList += [PSCustomObject]@{
+            Domain = $domain
+            AdditionalRecipients = $additionalEmails
+        }
+    }
+
+    if ($domainList.Count -eq 0) {
         throw "No domains found in file: $Path"
     }
 
-    return $domains
+    return $domainList
 }
 
 function Test-DomainThreat {
@@ -240,7 +267,13 @@ function Send-ThreatAlert {
         $EmailSettings,
 
         [Parameter(Mandatory = $false)]
-        [switch]$IsTest
+        [array]$AdditionalRecipients = @(),
+
+        [Parameter(Mandatory = $false)]
+        [switch]$IsTest,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$IsDomainSpecific
     )
 
     $subject = if ($IsTest) {
@@ -328,6 +361,185 @@ function Send-ThreatAlert {
 </html>
 "@
 
+    # Prepare recipients list
+    $recipients = @()
+    if ($IsDomainSpecific -and $AdditionalRecipients.Count -gt 0) {
+        # For domain-specific alerts, send ONLY to additional recipients
+        $recipients = $AdditionalRecipients
+    }
+    else {
+        # For main alerts, send to default recipients
+        $recipients = $EmailSettings.To
+
+        # Add any additional recipients
+        if ($AdditionalRecipients.Count -gt 0) {
+            $recipients = @($recipients) + @($AdditionalRecipients) | Select-Object -Unique
+        }
+    }
+
+    # Prepare email parameters
+    $mailParams = @{
+        From       = $EmailSettings.From
+        To         = $recipients
+        Subject    = $subject
+        Body       = $htmlBody
+        BodyAsHtml = $true
+        SmtpServer = $EmailSettings.SmtpServer
+        Port       = $EmailSettings.Port
+    }
+
+    # Add CC if specified (only for main alerts, not domain-specific)
+    if ($EmailSettings.Cc -and -not $IsDomainSpecific) {
+        $mailParams['Cc'] = $EmailSettings.Cc
+    }
+
+    # Add authentication if specified
+    if ($EmailSettings.Username -and $EmailSettings.Password) {
+        $securePassword = ConvertTo-SecureString $EmailSettings.Password -AsPlainText -Force
+        $credential = New-Object System.Management.Automation.PSCredential($EmailSettings.Username, $securePassword)
+        $mailParams['Credential'] = $credential
+    }
+
+    # Add SSL if specified
+    if ($EmailSettings.UseSsl) {
+        $mailParams['UseSsl'] = $true
+    }
+
+    try {
+        Send-MailMessage @mailParams
+        return $true
+    }
+    catch {
+        throw "Failed to send email: $_"
+    }
+}
+
+function Send-DailySummary {
+    <#
+    .SYNOPSIS
+        Sends a daily summary email with the status of all monitored domains.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [array]$AllDomains,
+
+        [Parameter(Mandatory = $true)]
+        $EmailSettings
+    )
+
+    $subject = "Daily Domain Status Report - $(Get-Date -Format 'MMM dd, yyyy')"
+
+    # Count statuses
+    $threatCount = ($AllDomains | Where-Object { $_.IsThreat }).Count
+    $cleanCount = ($AllDomains | Where-Object { -not $_.IsThreat }).Count
+    $totalCount = $AllDomains.Count
+
+    # Build HTML email body
+    $htmlBody = @"
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        h1 { color: #1976d2; }
+        h2 { color: #424242; }
+        table { border-collapse: collapse; width: 100%; margin-top: 20px; }
+        th { background-color: #1976d2; color: white; padding: 12px; text-align: left; }
+        td { border: 1px solid #ddd; padding: 10px; }
+        tr:nth-child(even) { background-color: #f2f2f2; }
+        .success { color: #388e3c; font-weight: bold; }
+        .warning { color: #f57c00; font-weight: bold; }
+        .danger { color: #d32f2f; font-weight: bold; }
+        .info { color: #1976d2; }
+        .stats-box { background-color: #e3f2fd; padding: 15px; border-radius: 5px; margin: 20px 0; }
+        .stats-item { display: inline-block; margin-right: 30px; }
+        .footer { margin-top: 20px; font-size: 12px; color: #666; border-top: 1px solid #ddd; padding-top: 10px; }
+        .status-clean { background-color: #e8f5e9; }
+        .status-threat { background-color: #ffebee; }
+    </style>
+</head>
+<body>
+    <h1>📊 Daily Domain Status Report</h1>
+    <p><strong>Report Date:</strong> $(Get-Date -Format 'MMMM dd, yyyy HH:mm:ss')</p>
+
+    <div class="stats-box">
+        <div class="stats-item">
+            <span style="font-size: 14px; color: #666;">Total Domains:</span><br>
+            <span style="font-size: 24px; font-weight: bold;">$totalCount</span>
+        </div>
+        <div class="stats-item">
+            <span style="font-size: 14px; color: #666;">Clean:</span><br>
+            <span style="font-size: 24px; font-weight: bold; color: #388e3c;">$cleanCount</span>
+        </div>
+        <div class="stats-item">
+            <span style="font-size: 14px; color: #666;">Threats:</span><br>
+            <span style="font-size: 24px; font-weight: bold; color: #d32f2f;">$threatCount</span>
+        </div>
+    </div>
+
+    <h2>Domain Status Details</h2>
+    <table>
+        <tr>
+            <th>Status</th>
+            <th>Domain</th>
+            <th>Malicious</th>
+            <th>Suspicious</th>
+            <th>Reputation</th>
+            <th>Notes</th>
+        </tr>
+"@
+
+    # Sort domains: threats first, then clean
+    $sortedDomains = $AllDomains | Sort-Object @{Expression = {$_.IsThreat}; Descending = $true}, Domain
+
+    foreach ($domainInfo in $sortedDomains) {
+        $statusIcon = if ($domainInfo.IsThreat) { "⚠️" } else { "✅" }
+        $statusText = if ($domainInfo.IsThreat) { "THREAT" } else { "Clean" }
+        $statusClass = if ($domainInfo.IsThreat) { "status-threat" } else { "status-clean" }
+        $statusColor = if ($domainInfo.IsThreat) { "danger" } else { "success" }
+
+        $maliciousCount = $domainInfo.Analysis.Stats.Malicious
+        $suspiciousCount = $domainInfo.Analysis.Stats.Suspicious
+        $reputation = if ($null -ne $domainInfo.Analysis.Reputation) { $domainInfo.Analysis.Reputation } else { "N/A" }
+
+        $maliciousClass = if ($maliciousCount -gt 5) { 'danger' } elseif ($maliciousCount -gt 0) { 'warning' } else { 'success' }
+        $reputationClass = if ($reputation -eq "N/A") { 'info' } elseif ($reputation -lt -50) { 'danger' } elseif ($reputation -lt 0) { 'warning' } else { 'success' }
+
+        $notes = if ($domainInfo.IsThreat) {
+            $domainInfo.Analysis.Reasons -join '<br>'
+        } else {
+            "No threats detected"
+        }
+
+        $htmlBody += @"
+        <tr class="$statusClass">
+            <td><span class="$statusColor">$statusIcon $statusText</span></td>
+            <td><strong>$($domainInfo.Domain)</strong></td>
+            <td class="$maliciousClass">$maliciousCount</td>
+            <td class="$(if ($suspiciousCount -gt 0) { 'warning' } else { 'success' })">$suspiciousCount</td>
+            <td class="$reputationClass">$reputation</td>
+            <td style="font-size: 12px;">$notes</td>
+        </tr>
+"@
+    }
+
+    $htmlBody += @"
+    </table>
+
+    <div class="footer">
+        <p><strong>Legend:</strong></p>
+        <ul style="font-size: 12px;">
+            <li><span class="success">✅ Clean</span> - Domain passed all security checks</li>
+            <li><span class="danger">⚠️ Threat</span> - Domain flagged for malicious activity or poor reputation</li>
+        </ul>
+        <p>This is an automated daily report from the VirusTotal Domain Monitor.</p>
+        <p>For immediate threats, you will receive a separate alert email.</p>
+    </div>
+</body>
+</html>
+"@
+
     # Prepare email parameters
     $mailParams = @{
         From       = $EmailSettings.From
@@ -361,7 +573,7 @@ function Send-ThreatAlert {
         return $true
     }
     catch {
-        throw "Failed to send email: $_"
+        throw "Failed to send daily summary email: $_"
     }
 }
 
@@ -434,34 +646,60 @@ try {
 
     # Check domains
     $threatenedDomains = @()
+    $allDomainResults = @()
     $checkedCount = 0
     $errorCount = 0
 
-    foreach ($domain in $domains) {
+    foreach ($domainEntry in $domains) {
         $checkedCount++
-        Write-Log -Message "[$checkedCount/$($domains.Count)] Checking domain: $domain" -Level Info -LogFile $logFile
+        $domainName = $domainEntry.Domain
+        $additionalRecipients = $domainEntry.AdditionalRecipients
+
+        Write-Log -Message "[$checkedCount/$($domains.Count)] Checking domain: $domainName" -Level Info -LogFile $logFile
+        if ($additionalRecipients.Count -gt 0) {
+            Write-Log -Message "  Additional recipients: $($additionalRecipients -join ', ')" -Level Info -LogFile $logFile
+        }
 
         try {
             # Get domain report from VirusTotal
-            $report = Get-VirusReport -ApiKey $config.ApiKey -DomainName $domain
+            $report = Get-VirusReport -ApiKey $config.ApiKey -DomainName $domainName
 
             if ($report -and $report.Data) {
                 # Analyze the report
                 $analysis = Test-DomainThreat -Report $report -Thresholds $config.Thresholds
 
+                # Store result for all domains (for daily summary)
+                $domainResult = @{
+                    Domain   = $domainName
+                    Analysis = $analysis
+                    IsThreat = $analysis.IsThreat
+                    AdditionalRecipients = $additionalRecipients
+                }
+                $allDomainResults += $domainResult
+
                 if ($analysis.IsThreat) {
-                    Write-Log -Message "THREAT DETECTED - $domain" -Level Warning -LogFile $logFile
-                    $threatenedDomains += @{
-                        Domain   = $domain
-                        Analysis = $analysis
-                    }
+                    Write-Log -Message "THREAT DETECTED - $domainName" -Level Warning -LogFile $logFile
+                    $threatenedDomains += $domainResult
                 }
                 else {
-                    Write-Log -Message "OK - $domain (Malicious: $($analysis.Stats.Malicious), Reputation: $($analysis.Reputation))" -Level Success -LogFile $logFile
+                    Write-Log -Message "OK - $domainName (Malicious: $($analysis.Stats.Malicious), Reputation: $($analysis.Reputation))" -Level Success -LogFile $logFile
                 }
             }
             else {
-                Write-Log -Message "No data returned for domain: $domain" -Level Warning -LogFile $logFile
+                Write-Log -Message "No data returned for domain: $domainName" -Level Warning -LogFile $logFile
+
+                # Add to results with N/A status
+                $allDomainResults += @{
+                    Domain   = $domainName
+                    Analysis = @{
+                        IsThreat = $false
+                        Stats = @{ Malicious = 0; Suspicious = 0 }
+                        Reputation = $null
+                        Reasons = @("No data available")
+                    }
+                    IsThreat = $false
+                    AdditionalRecipients = $additionalRecipients
+                }
             }
 
             # Rate limiting - respect API limits
@@ -471,7 +709,20 @@ try {
         }
         catch {
             $errorCount++
-            Write-Log -Message "Error checking domain $domain : $_" -Level Error -LogFile $logFile
+            Write-Log -Message "Error checking domain $domainName : $_" -Level Error -LogFile $logFile
+
+            # Add to results with error status
+            $allDomainResults += @{
+                Domain   = $domainName
+                Analysis = @{
+                    IsThreat = $false
+                    Stats = @{ Malicious = 0; Suspicious = 0 }
+                    Reputation = $null
+                    Reasons = @("Error during check: $_")
+                }
+                IsThreat = $false
+                AdditionalRecipients = $additionalRecipients
+            }
 
             # Continue with next domain unless too many errors
             if ($errorCount -gt 5) {
@@ -485,8 +736,32 @@ try {
         Write-Log -Message "Sending alert email for $($threatenedDomains.Count) threatened domains" -Level Warning -LogFile $logFile
 
         try {
+            # Send main alert to default recipients with ALL threatened domains
             Send-ThreatAlert -ThreatenedDomains $threatenedDomains -EmailSettings $config.EmailSettings
-            Write-Log -Message "Alert email sent successfully" -Level Success -LogFile $logFile
+            Write-Log -Message "Main alert email sent to default recipients" -Level Success -LogFile $logFile
+
+            # Send domain-specific alerts to additional recipients
+            $domainsWithAdditionalRecipients = $threatenedDomains | Where-Object { $_.AdditionalRecipients.Count -gt 0 }
+            if ($domainsWithAdditionalRecipients.Count -gt 0) {
+                Write-Log -Message "Sending $($domainsWithAdditionalRecipients.Count) domain-specific alerts" -Level Info -LogFile $logFile
+
+                foreach ($domainThreat in $domainsWithAdditionalRecipients) {
+                    try {
+                        # Send alert for this specific domain to its additional recipients
+                        Send-ThreatAlert `
+                            -ThreatenedDomains @($domainThreat) `
+                            -EmailSettings $config.EmailSettings `
+                            -AdditionalRecipients $domainThreat.AdditionalRecipients `
+                            -IsDomainSpecific
+
+                        Write-Log -Message "Domain-specific alert sent for $($domainThreat.Domain) to $($domainThreat.AdditionalRecipients -join ', ')" -Level Success -LogFile $logFile
+                    }
+                    catch {
+                        Write-Log -Message "Failed to send domain-specific alert for $($domainThreat.Domain): $_" -Level Error -LogFile $logFile
+                        # Continue with other alerts even if one fails
+                    }
+                }
+            }
         }
         catch {
             Write-Log -Message "Failed to send alert email: $_" -Level Error -LogFile $logFile
@@ -495,6 +770,71 @@ try {
     }
     else {
         Write-Log -Message "No threats detected. All domains are clean." -Level Success -LogFile $logFile
+    }
+
+    # Daily Summary Email Logic
+    if ($config.DailySummary -and $config.DailySummary.Enabled) {
+        $summaryHour = if ($config.DailySummary.SendAtHour) { $config.DailySummary.SendAtHour } else { 8 }
+        $currentHour = (Get-Date).Hour
+        $today = (Get-Date).Date
+
+        # Path to track last summary send time
+        $summaryTrackFile = Join-Path -Path ([System.IO.Path]::GetDirectoryName($logFile)) -ChildPath ".last-daily-summary"
+
+        # Check if summary should be sent
+        $shouldSendSummary = $false
+        $lastSummaryDate = $null
+
+        if (Test-Path $summaryTrackFile) {
+            try {
+                $lastSummaryDate = Get-Content $summaryTrackFile -Raw | ConvertFrom-Json | Select-Object -ExpandProperty LastSent | Get-Date
+                $daysSinceLastSummary = ($today - $lastSummaryDate.Date).Days
+
+                # Send if it's past the configured hour and we haven't sent today
+                if ($daysSinceLastSummary -ge 1 -and $currentHour -ge $summaryHour) {
+                    $shouldSendSummary = $true
+                }
+            }
+            catch {
+                Write-Log -Message "Could not read last summary date, will send summary" -Level Warning -LogFile $logFile
+                $shouldSendSummary = $true
+            }
+        }
+        else {
+            # No record of previous summary, send one
+            $shouldSendSummary = $true
+        }
+
+        if ($shouldSendSummary -and $allDomainResults.Count -gt 0) {
+            Write-Log -Message "Sending daily summary email for $($allDomainResults.Count) domains" -Level Info -LogFile $logFile
+
+            try {
+                Send-DailySummary -AllDomains $allDomainResults -EmailSettings $config.EmailSettings
+                Write-Log -Message "Daily summary email sent successfully" -Level Success -LogFile $logFile
+
+                # Update last summary send time
+                @{
+                    LastSent = Get-Date -Format 'o'
+                } | ConvertTo-Json | Set-Content $summaryTrackFile
+            }
+            catch {
+                Write-Log -Message "Failed to send daily summary email: $_" -Level Error -LogFile $logFile
+                # Don't throw - continue execution even if summary fails
+            }
+        }
+        else {
+            if ($allDomainResults.Count -eq 0) {
+                Write-Log -Message "Skipping daily summary - no domains checked" -Level Info -LogFile $logFile
+            }
+            else {
+                $nextSummaryTime = if ($lastSummaryDate) {
+                    $lastSummaryDate.Date.AddDays(1).AddHours($summaryHour)
+                } else {
+                    $today.AddHours($summaryHour)
+                }
+                Write-Log -Message "Daily summary not due yet. Next summary scheduled for: $nextSummaryTime" -Level Info -LogFile $logFile
+            }
+        }
     }
 
     # Summary
